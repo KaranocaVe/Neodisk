@@ -1,0 +1,101 @@
+name: Build latest (unsigned)
+
+# Public, credential-free packaging for this fork. Adding this workflow to
+# main starts the first build; subsequent builds can be started manually.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/build-latest.yml
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: x86_64
+          - runner: macos-15-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift --version
+          swift build -c release --product Neodisk
+          swift build -c release --show-bin-path
+
+      - name: Package app, ZIP and DMG (ad-hoc signed)
+        shell: bash
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          VERSION=$(sed -n 's/.*static let string = "\([^"]*\)".*/\1/p' Sources/NeodiskAppModel/AppVersion.swift)
+          test -n "$VERSION"
+          BIN_DIR=$(swift build -c release --show-bin-path)
+          test -x "$BIN_DIR/Neodisk"
+          lipo -verify_arch "$TARGET_ARCH" "$BIN_DIR/Neodisk"
+
+          mkdir -p dist stage/Neodisk.app/Contents/{MacOS,Resources,Frameworks}
+          APP="$PWD/stage/Neodisk.app"
+          ditto "$BIN_DIR/Neodisk" "$APP/Contents/MacOS/Neodisk"
+          ditto Packaging/Info.plist "$APP/Contents/Info.plist"
+          ditto Packaging/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
+          # Fork builds should not replace themselves from the official update feed.
+          /usr/libexec/PlistBuddy -c 'Set :SUEnableAutomaticChecks false' "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Delete :SUFeedURL' "$APP/Contents/Info.plist"
+
+          for DIR in Localization/*.lproj; do
+            ditto "$DIR" "$APP/Contents/Resources/$(basename "$DIR")"
+          done
+
+          SPARKLE=$(find .build -type d -name Sparkle.framework -print -quit)
+          test -n "$SPARKLE"
+          ditto "$SPARKLE" "$APP/Contents/Frameworks/Sparkle.framework"
+
+          # The SwiftPM executable can refer to Sparkle by @rpath; resolve
+          # that dependency inside the installed application bundle.
+          install_name_tool -add_rpath '@executable_path/../Frameworks' "$APP/Contents/MacOS/Neodisk" || {
+            otool -l "$APP/Contents/MacOS/Neodisk" | grep -A2 LC_RPATH | grep -q '@executable_path/../Frameworks'
+          }
+
+          printf 'APPL????' > "$APP/Contents/PkgInfo"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          PREFIX="Neodisk-${VERSION}-${GITHUB_SHA::7}-macos-$TARGET_ARCH"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/$PREFIX.zip"
+          mkdir -p dmg-root
+          ditto "$APP" dmg-root/Neodisk.app
+          ln -s /Applications dmg-root/Applications
+          hdiutil create -quiet -volname Neodisk -srcfolder dmg-root -format UDZO -ov "dist/$PREFIX.dmg"
+          ls -lh dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neodisk-macos-${{ matrix.arch }}-latest
+          path: |
+            dist/*.zip
+            dist/*.dmg
+          if-no-files-found: error
+          retention-days: 30
+
+  linux:
+    name: Linux packages
+    uses: ./.github/workflows/linux-package.yml
+    with:
+      channel: stable
